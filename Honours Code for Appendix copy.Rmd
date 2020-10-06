@@ -1,0 +1,789 @@
+---
+  title: "Code for Modelling Metocean Conditions on Australia's North West Shelf"
+  author: "Max Anderson Loake"
+  header-includes:
+   - \usepackage{bm}
+   - \newcommand{\vect}[1]{\boldsymbol{#1}}
+  output: 
+    bookdown::html_document2:
+      keep_tex: true
+      number_sections: true
+---
+
+Clean workspace and import libraries
+```{r, results='hide',message=FALSE, warning=FALSE,error=FALSE}
+  #setwd("~/Dropbox/Honours Max/")
+  rm(list = ls())
+  #for repeatability
+  set.seed(12345)
+  
+  library(BVAR)
+  library(ggplot2)
+  library(gridExtra)
+  library(invgamma)
+  library(MASS)
+  library(dplyr)
+  library(MCMCpack)
+  library(matrixcalc)
+  library(LaplacesDemon)
+  library(coda)
+  library(plyr)
+  library(Metrics)
+  library(astsa)
+  library(fGarch)
+  library(forecast)
+  library(bayesplot)
+  library("stochvol")
+  
+  theme_set(theme_bw())
+  
+  theme_update(text=element_text(family="Times New Roman"))
+```
+
+
+# Bivariate Regression
+
+## Introduction 
+
+To achieve a one-to-one relationship between forecasts and measurements, we begin by only considering measurements with corresponding 0 hour forecasts, and conduct a linear regression on this set of measurements and 0 hour forecasts.
+
+The regression takes the form:
+\begin{equation}
+\begin{pmatrix} y_{n_t} \\ y_{e_t} \end{pmatrix}=\begin{pmatrix} \beta_1 + \beta_2 f_{n_t}+\beta_3 f_{e_t} \\ \beta_4 + \beta_5 f_{n_t} + \beta_6 f_{e_t} \end{pmatrix} +\vect{\xi}_t, \quad \vect{\xi}_t \sim \mathcal{N}_2(0, \vect{\Omega})
+(\#eq:multivariateregression)
+\end{equation}
+In Equation \@ref(eq:multivariateregression), $y_{n_t}$ and $y_{e_t}$ denote the northing and easting measurements at time $t$, while $f_{n_t}$ and $f_{e_t}$ represent the northing and easting components of the corresponding 0 hour forecast. We use $\mathcal{N}_p$ to denote a $p$-dimensional Gaussian distribution. The error terms at each time point are independent and identically distributed with mean $(0 , 0)$ and variance given by the $2 \times 2$ covariance matrix $\vect{\Omega}$. 
+
+Let $p$ represent the number of measurement-forecast pairs. By defining $\vect{x}_t = (1, f_{n_t}, f_{e_t})$ and $$\vect{\beta} = \begin{pmatrix}\beta_1 & \beta_4 \\ \beta_2 & \beta_5 \\ \beta_3 & \beta_6 \end{pmatrix} ,$$ Equation \@ref(eq:multivariateregression) can be written in matrix form as:
+\begin{equation}
+\vect{y} = \vect{X}\vect{\beta} + \vect{\xi}, \quad \vect{\xi} \sim \mathcal{MN}_{p\times2}(0, \vect{I}_p, \vect{\Omega}) (\#eq:multivariateregressionvect1)
+\end{equation}
+where $\vect{I}_p$ is the $p \times p$ identity matrix. In Equation \@ref(eq:multivariateregressionvect1), $\vect{y}$ is the $p \times 2$ matrix whose $i$th row is $(y_{n_t}, y_{e_t})$, and $\vect{X}$ is the $p \times 3$ matrix whose $i$th row is $\vect{x}_i$. We use $\mathcal{MN}_{p\times q}$ to denote the Matrix Normal distribution producing a random matrix of size $p \times q$. The first parameter of the Matrix Normal distribution defines the mean of the matrix produced, and the second and third represent the variance between rows and columns respectively. In this case, each row is independent and follows a $2$-dimensional Gaussian distribution with mean $(0,0)$ and variance $\vect{\Omega}$. Equation \@ref(eq:multivariateregressionvect1) can alternatively be written as:
+\begin{equation}
+p(\vect{y}|\vect{X},\vect{\beta}, \vect{\Omega}) \sim \mathcal{MN}_{p \times 2} (\vect{X}\vect{\beta}, \vect{I}_p, \vect{\Omega}) (\#eq:multivariateregressionvect2)
+\end{equation}
+
+Assume the data and libraries have been imported as above. 
+```{r}
+  set.seed(1)
+  wind_fore <- readRDS("example_data/wind_fore.RDS") %>%
+    as_tibble()
+
+  wind_meas <- readRDS("example_data/wind_meas.RDS") %>%
+    as_tibble()
+  
+  #remove duplicate wind measurements
+  wind_meas <- dplyr::distinct(wind_meas)
+
+  #two duplicates remain with different measurements, leave only first value
+  wind_meas <- wind_meas[-(which(duplicated(wind_meas$time))),]
+
+  
+  #create an hourly array of times from 2017-07-17 13:00:00 to 2019-06-22 07:00:00
+  tt_start <- as.POSIXct("2017-07-17 13:00:00", tz="Australia/Perth")
+  tts <- seq(tt_start, by = "hours", length = 24*2*365-24*25-5)
+  full_time <- data.frame(time = tts)
+
+  #perform left join with measurements, so that times without measurements are still included
+  wind_meas_complete <- full_time %>%
+    dplyr::left_join(wind_meas %>%
+        dplyr::select(time = time, 
+                      easting_meas = ew_meas,
+                      northing_meas = nw_meas), 
+        by = 'time')
+  
+  #convert forecasts to a single time series by taking the smallest horizon for each time predicted
+  wind_fore$horizon <- as.numeric(wind_fore$time_predict-wind_fore$time_issued)/60/60
+  
+  #how many missing 0 hour forecasts:
+  #length(wind_fore[which(is.na(wind_fore$ew_fore) & wind_fore$horizon == 0),]$horizon)
+  
+  wind_fore_na_omit <- na.omit(wind_fore)
+  wind_fore_single <- wind_fore_na_omit %>% group_by(time_predict) %>% top_n(-1, horizon)
+  
+  wind_fore_nowcasts <- wind_fore %>% dplyr::filter(wind_fore$horizon == 0) 
+  missing_fore_indexes <- which(is.na(wind_fore_nowcasts$ew_fore))
+
+  for (i in 1:length(missing_fore_indexes)){
+    replacement_index <- which(wind_fore_single$time_predict == wind_fore_nowcasts[missing_fore_indexes[i],]$time_predict)
+    wind_fore_nowcasts[missing_fore_indexes[i],]<- wind_fore_single[replacement_index,]
+  }
+  
+  wind_comb <- wind_meas_complete %>%
+    dplyr::inner_join(wind_fore_nowcasts %>%
+        dplyr::select(time_issued,
+           time = time_predict,
+           easting_fore = ew_fore,
+           northing_fore = nw_fore,
+           horizon = horizon), 
+      by = 'time')
+  
+  #all those missing easting meas also miss northing meas
+  missing_meas_indexes <- which(is.na(wind_comb$northing_meas))
+  missing_meas_forecasts <- cbind(1,wind_comb$northing_fore[missing_meas_indexes], wind_comb$easting_fore[missing_meas_indexes])
+  
+  Y <- data.matrix(wind_comb %>% dplyr::select(northing_meas, easting_meas))
+  X <- data.matrix(cbind(1,wind_comb %>% dplyr::select(northing_fore, easting_fore)))
+  N <- length(Y[,1])
+  
+  missing_length <- length(missing_meas_indexes)
+  identity_missing_length <- diag(missing_length)
+  predict_length <- 0
+  
+  
+```
+
+Plot Data
+```{r}
+#wind_foremeas_northing.pdf 7 x 3
+ggplot(wind_comb) + 
+    geom_line(aes(x = time, y = northing_meas, color = "Measured")) + 
+    geom_line(aes(x = time, y = northing_fore, color = "Forecast")) +
+    theme(legend.position = "none", text=element_text(family="Times New Roman")) +
+    ylab("Wind Northings") + xlab("Date") +
+    scale_color_manual(name = "", values = c("Measured" = "blue", "Forecast" = "black"))
+
+#wind_foremeas_easting.pdf 7 x 3
+ggplot(wind_comb) + 
+    geom_line(aes(x = time, y = easting_meas, color = "Measured")) + 
+    geom_line(aes(x = time, y = easting_fore, color = "Forecast")) +
+    theme(legend.position = "none", text=element_text(family="Times New Roman")) +
+    ylab("Wind Eastings") + xlab("Date") +
+    scale_color_manual(name = "", values = c("Measured" = "blue", "Forecast" = "black"))
+
+wind_comb_directional <- na.omit(wind_comb)
+wind_comb_directional$magnitude_meas <- sqrt(wind_comb_directional$easting_meas^2+wind_comb_directional$northing_meas^2)
+
+get_bearing <- function(input){
+  northing <- input[1]; easting <- input[2];
+  y <- 90-atan2(northing,easting)*180/pi
+  if (y < 0) {y <- y + 360}
+  y
+}
+wind_comb_directional$direction <- apply(cbind(wind_comb_directional$northing_meas, wind_comb_directional$easting_meas), 1,get_bearing)
+
+hist(wind_comb_directional$direction)
+
+#wind_magnitudes 6 x 3
+wind_mags <- ggplot(wind_comb_directional, aes(x = wind_comb_directional$magnitude_meas)) + 
+    geom_histogram(aes(y =..density..),
+                   bins = 30,
+                   colour = "black", 
+                   fill = "white") +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+  )+
+  ylab("Frequency") + xlab("Magnitude (metres/second)")
+
+#wind_directions 3.5 x 3.5
+wind_direcs <- ggplot(wind_comb_directional, aes(x=direction)) +
+  geom_histogram(color="black", fill="white", boundary = 0, binwidth = 22.5) +
+  scale_x_continuous("Direction (degrees from north)", position = "bottom", breaks = c(0, 90, 180, 270), labels = c(0, 90, 180, 270)) +
+  scale_y_continuous() +
+  coord_polar() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.border = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+  #library(cowplot)
+  #wind_mags_direcs.pdf 6 x 3
+  #plot_grid(wind_mags, wind_direcs, align = "h", ncol=2, widths = unit(0.5, "npc"))
+  #grid.arrange(wind_mags, wind_direcs, ncol=2, heights = unit(0.86,"npc"))
+
+```
+
+
+## Missing Data 
+In the set of times at which measurements would be expected to have a corresponding 0-hour forecast (i.e. times at which forecasts are typically issued), there are 15 missing measurements and 33 missing forecasts. In all missing measurements and forecasts both the northing and easting components are absent. 
+
+Missing forecasts are substituted with the forecast with the next smallest prediction horizon for the same time, which is typically the 6 hour forecast. For the missing measurements, let $\vect{y}_{mis}$ represent the unobserved measurements, $\vect{y}_{obs}$ the observed measurements, and $\vect{y}$ the union of observed and unobserved elements. 
+
+Assumptions (?) missing at random, ignorable
+
+## Prior Distributions 
+Semi-conjugate prior distributions are used for $\vect{\beta}$ and $\vect{\Omega}$:
+\begin{align}
+p(\vect{\Omega}) &\sim \mbox{Inverse-Wishart}(\vect{\Psi},v) (\#eq:Omegaprior) \\
+p(\vect{\beta}|\vect{\Omega}) &\sim \mathcal{MN}_{3 \times 2}(\vect{\beta_0}, \vect{\Lambda_0}, \vect{\Omega}) (\#eq:betapriormv)
+\end{align}
+In Equation \@ref(eq:Omegaprior), $\vect{\Psi}$ is a $2 \times 2$ scale matrix and $v$ is a constant representing the degrees of freedom. In Equation \@ref(eq:betapriormv), $\vect{\beta_0}$ is a $3 \times 2$ mean matrix and $\vect{\Lambda_0}$ is a $3 \times 3$ covariance matrix. The prior parameters are chosen to be $\vect{\Psi} = \vect{I}_2$, $v = 2$, $\vect{\Lambda_0} = \vect{I}_3$ and 
+
+\begin{equation*}
+\vect{\beta_0} = \begin{pmatrix}0 & 0 \\ 1 & 0 \\ 0 & 1 \end{pmatrix}. (\#eq:beta0inprior)
+\end{equation*}
+[justification]. 
+
+```{r}
+  psi <- cbind(diag(2));   v <- 2
+  beta_0 <- cbind(c(0,1,0),c(0,0,1)); lambda_0 <- diag(3)
+```
+
+## Conditional Posterior Densities
+The prior distributions lead to the conditional posterior densities:
+
+\begin{align}
+p(\vect{\Omega} | \vect{y}_{mis}, \vect{y}_{obs}, \vect{\beta}) &\sim \mbox{Inverse-Wishart}\left((\vect{y}-\vect{X\beta})^T(\vect{y}-\vect{X\beta})+\vect{\Psi}, p+v\right)  (\#eq:omegaconditionalposterior)\\
+p(\vect{\beta} | \vect{\Omega}, \vect{y}_{mis}, \vect{y}_{obs}) &\sim \mathcal{MN}_{3\times2}(\vect{\mu_\beta}, \vect{U}, \vect{V}) (\#eq:betaconditionalposterior)
+\end{align}
+
+where $\vect{\mu_\beta}= (\vect{X}^T\vect{X}+\vect{\Lambda_0}^{-1})^{-1}(\vect{X}^T\vect{y}+\vect{\Lambda_0}^{-1}\vect{\beta_0})$, $\vect{U}=(\vect{X}^T\vect{X}+\vect{\Lambda_0}^{-1})^{-1}$, $\vect{V}=\vect{\Omega}$. Again, the first parameter in the Inverse-Wishart distribution is a $2 \times 2$ matrix while the second is a constant. In the Matrix Normal distribution,  $\vect{\mu_\beta}$ is a $3 \times 2$ matrix, $\vect{U}$ is a $3 \times 3$ matrix, and $\vect{V}$ is a $2 \times 2$ matrix.
+
+If $m$ is used to denote the number of missing observations, then the conditional posterior distribution of the missing data is:
+\begin{equation}
+(\#eq:missingdatamultivariate)
+p(\vect{y}_{mis} | \vect{\Omega}, \vect{\beta}, \vect{y}_{obs}) = p(\vect{y}_{mis} | \vect{\Omega}, \vect{\beta}) \sim \mathcal{MN}_{m \times 2}(\vect{X}_{mis}\vect{\beta}, \vect{I}_m, \vect{\Omega}) 
+\end{equation}
+In Equation \@ref(eq:missingdatamultivariate), the $m \times 3$ matrix $\vect{X}_{mis}$ is the subset of $\vect{X}$ containing only the rows with forecasts that correspond to missing measurements. All forecasts in $\vect{X}_{mis}$ are observed.
+
+This is equivalent to:
+$$p(vec(\vect{B})|\Omega, \vect{Y_{mis}}, \vect{Y_{obs}}) \sim \mathcal{N}_6(vec(\vect{\mu_\beta}), V \otimes U) $$
+
+## Gibbs Sampling
+The Gibbs Sampling Procedure is carried out as follows:
+
+1. Draw initial values for $\vect{\Omega}$, $\vect{\beta}$ and $\vect{y}_{mis}$ and label as $\vect{\Omega}^{(1)}$, $\vect{\beta}^{(1)}$ and $\vect{y}_{mis}^{(1)}$:
+    + The two initial values for the regression coefficients in $\vect{\beta}$ are drawn from random uniform distributions on [-3,3].
+    + A $2 \times 2$ matrix is produced with each element following a uniform distribution on [-2, 2], which is multiplied by its transpose to produce $\vect{\Omega}^{(1)}$. 
+    + Each initial value in  $\vect{y}_{mis}^{(1)}$ is set to be the sum of the relevant forecast and a draw from a random uniform distribution on [-10,10]. 
+
+2. For $s = 2, \dots, 10 000$:
+	 + Draw $\vect{\Omega}^{(s)}$ using $p(\vect{\Omega} | \vect{y}_{obs}, \vect{y}_{mis}^{^{(s-1)}}, \vect{\beta}^{(s-1)})$
+	 + Draw ${\vect{\beta}}^{(s)}$ from $p(\vect{\beta} | \vect{y}_{obs},\vect{\Omega}^{(s)}, \vect{y}_{mis}^{(s-1)})$
+	 + Draw $\vect{y}_{mis}^{(s)}$ from $p(\vect{y}_{mis} | \vect{\Omega}^{(s)}, \vect{\beta}^{(s)})$
+
+The following function is used to simulate $\Omega$ for a given value of $\vect{\beta}$ and $\vect{y}_{mis}$ 
+```{r}
+  shape <- N + v
+
+  draw_omega <- function(beta, Y){
+    scale <- t(Y - (X %*% beta))%*%(Y- (X%*%beta)) + psi
+    omega <- riwish(shape, scale)
+    return(omega)
+  }
+```
+
+The following function is used to simulate $\beta$ for a given value of $\Omega$ and and $\vect{y}_{mis}$ 
+```{r}
+  
+  XT <- t(X)
+  XTX_plus_lambda_inv_inv <- solve(XT %*% X+solve(lambda_0))
+  lambda_0_inv_beta_0 <- solve(lambda_0) %*% beta_0
+  
+  draw_beta <- function(omega, Y, standard_normal_sample){
+    vec_beta_mean <- vec(XTX_plus_lambda_inv_inv %*% (XT %*% Y +lambda_0_inv_beta_0))
+    
+    variance <- kronecker(omega, XTX_plus_lambda_inv_inv)
+    vec_beta <- vec_beta_mean + chol(variance) %*% standard_normal_sample
+    beta <- matrix(vec_beta, ncol = 2)
+    return(beta) 
+  }
+```
+
+The following function is used to simulate $\vect{y}_{mis}$ for a given value of $\Omega, \vect{\beta}$
+
+```{r}
+
+  draw_ymis <- function(beta, omega, standard_normal_sample){
+    updated_forecasts <- missing_meas_forecasts %*% beta 
+    variance <- kronecker(omega, identity_missing_length)
+    
+    vec_y_mis <- vec(updated_forecasts) + chol(variance) %*% standard_normal_sample
+    y_mis <- matrix(vec_y_mis, ncol = 2)
+    return(y_mis)
+  }
+
+```
+
+Set up a function that performs the gibbs sampling for the bivariate model
+```{r}
+
+  gibbs_sample_bivariate <- function(number_of_gibbs_iterations, with_prediction = FALSE){
+
+    #initialise omega with value from prior distribution
+    random_two_by_two <- matrix(data=runif(4,-2,2), 2, 2)
+    omega <- random_two_by_two %*% t(random_two_by_two)
+    
+    #initialise beta with randomly generated values from uniform(-3,3) distribution
+    beta <- matrix(data=runif(6,-3,3), 3,2)
+    
+    #initialise y_mis with their forecasts adding to each a draw from a random uniform distribution on [-10,10]
+    y_mis <- missing_meas_forecasts[,2:3] + matrix(runif(missing_length*2, -10, 10), missing_length, 2)
+    
+    #set up arrays for beta and omega to store their values at each iteration
+    sampled_beta <- array(0, dim=c(3,2,number_of_gibbs_iterations))
+    sampled_omega <- matrix( 0, number_of_gibbs_iterations, 4)
+    sampled_y_mis <- array(0, dim=c(missing_length, 2, number_of_gibbs_iterations))
+    
+    sampled_residuals <- array(0, dim= c(N, 2, number_of_gibbs_iterations-1))
+    
+    #add starting values to the arrays
+    sampled_beta[,,1] <- beta
+    sampled_omega[1,] <- omega
+    sampled_y_mis[,,1] <- y_mis
+    
+    sampled_y_predict <- array(0, dim=c(predict_length, 2, number_of_gibbs_iterations - 1))
+    
+    standard_normal_samples <- mvrnorm(number_of_gibbs_iterations, matrix(0,1,6), diag(6))
+    standard_normal_samples_for_y_mis <- mvrnorm(number_of_gibbs_iterations, matrix(0,1,missing_length*2), diag(missing_length*2))
+    
+    #update Y with missing data starting values
+    Y[missing_meas_indexes,] <- y_mis
+    
+      
+    for (i in 2:number_of_gibbs_iterations){
+      
+      y_mis <- draw_ymis(beta,omega, standard_normal_samples_for_y_mis[i,])
+      Y[missing_meas_indexes,] <- y_mis
+      
+      omega <- draw_omega(beta, Y)
+      beta <- draw_beta(omega, Y, standard_normal_samples[i,])
+      
+      sampled_beta[,,i] <- beta
+      sampled_omega[i,] <- omega
+      sampled_y_mis[,,i] <- y_mis
+      
+      residuals <- Y - X %*% beta
+      sampled_residuals[,1,i-1] <- residuals[,1]
+      sampled_residuals[,2,i-1] <- residuals[,2]
+      
+      if(with_prediction){
+        updated_mean <- predict_forecasts %*% beta
+        for (k in 1:predict_length){
+          sampled_y_predict[k,,i-1] <- updated_mean[k,] + mvrnorm(1, c(0,0), omega)
+        }
+      }
+    }
+    return(list(beta=sampled_beta,omega=sampled_omega, y_mis=sampled_y_mis, y_predict=sampled_y_predict, residuals=sampled_residuals))
+  }
+
+```
+
+## MCMC Checks
+
+The Gibbs Sampling process was completed three times to produce three separate chains. The trace plots for the regression parameters are displayed in the figures below the code, which demonstrate that convergence is taking place between the three chains.
+
+```{r}
+  n <- 10000
+  
+  wind_chain1 <- gibbs_sample_bivariate(n)
+  wind_chain2 <- gibbs_sample_bivariate(n)
+  wind_chain3 <- gibbs_sample_bivariate(n)
+  
+  wind_chains <- list(chain1=wind_chain1, chain2=wind_chain2, chain3=wind_chain3 )
+  
+  gibbs_chain1 <- wind_chains$chain1
+  gibbs_chain2 <- wind_chains$chain2
+  gibbs_chain3 <- wind_chains$chain3
+  
+  warm_up <- 5000
+  
+```
+
+```{r}
+  chain1 <- cbind(gibbs_chain1$beta[1,1,], gibbs_chain1$beta[2,1,],gibbs_chain1$beta[3,1,],gibbs_chain1$beta[1,2,], gibbs_chain1$beta[2,2,], gibbs_chain1$beta[3,2,], gibbs_chain1$omega[,1], gibbs_chain1$omega[,2], gibbs_chain1$omega[,4], gibbs_chain1$omega[,2]/sqrt(gibbs_chain1$omega[,1]*gibbs_chain1$omega[,4]))
+  colnames(chain1) <- c('beta[n[1]]', 'beta[n[2]]','beta[n[3]]','beta[e[1]]','beta[e[2]]','beta[e[3]]', 'Omega["1,1"]','Omega["1,2"]', 'Omega["2,2"]', 'Correlation')
+  mcmc_chain1 <- mcmc(chain1, start=1,end=10000)
+  
+  chain2 <- cbind(gibbs_chain2$beta[1,1,], gibbs_chain2$beta[2,1,],gibbs_chain2$beta[3,1,],gibbs_chain2$beta[1,2,], gibbs_chain2$beta[2,2,], gibbs_chain2$beta[3,2,], gibbs_chain2$omega[,1], gibbs_chain2$omega[,2], gibbs_chain2$omega[,4], gibbs_chain2$omega[,2]/sqrt(gibbs_chain2$omega[,1]*gibbs_chain2$omega[,4]))
+  colnames(chain2) <- c('beta[n[1]]', 'beta[n[2]]','beta[n[3]]','beta[e[1]]','beta[e[2]]','beta[e[3]]', 'Omega["1,1"]','Omega["1,2"]', 'Omega["2,2"]', 'Correlation')
+  mcmc_chain2 <- mcmc(chain2, start=1,end=10000)
+  
+  chain3 <- cbind(gibbs_chain3$beta[1,1,], gibbs_chain3$beta[2,1,],gibbs_chain3$beta[3,1,],gibbs_chain3$beta[1,2,], gibbs_chain3$beta[2,2,], gibbs_chain3$beta[3,2,], gibbs_chain3$omega[,1], gibbs_chain3$omega[,2], gibbs_chain3$omega[,4], gibbs_chain3$omega[,2]/sqrt(gibbs_chain3$omega[,1]*gibbs_chain3$omega[,4]))
+  colnames(chain3) <- c('beta[n[1]]', 'beta[n[2]]','beta[n[3]]','beta[e[1]]','beta[e[2]]','beta[e[3]]', 'Omega["1,1"]','Omega["1,2"]', 'Omega["2,2"]', 'Correlation')
+  mcmc_chain3 <- mcmc(chain3, start=1,end=10000)
+  
+  mcmc_chains <- mcmc.list(mcmc_chain1, mcmc_chain2, mcmc_chain3)
+  
+  mcmc_chains_post <- window(mcmc_chains, start=5000, end=10000)
+```
+
+
+## Results
+
+
+```{r}
+
+  color_scheme_set(c("blue", "yellow", "red", "orange", "green", "pink"))
+  # 8 x 6 bivreg_trace_plots
+  mcmc_trace(mcmc_chains, pars=c('beta[n[1]]', 'beta[n[2]]','beta[n[3]]','beta[e[1]]','beta[e[2]]','beta[e[3]]', 'Omega["1,1"]','Omega["1,2"]', 'Omega["2,2"]'), facet_args = list(labeller = ggplot2::label_parsed)) + facet_text(size = 12)
+  
+  color_scheme_set('mix-darkgray-blue')
+  # 8 x 6 bivreg_postdens_plots
+  mcmc_dens(mcmc_chains_post, pars=c('beta[n[1]]', 'beta[n[2]]','beta[n[3]]','beta[e[1]]','beta[e[2]]','beta[e[3]]', 'Omega["1,1"]','Omega["1,2"]', 'Omega["2,2"]'), facet_args = list(labeller = ggplot2::label_parsed)) + facet_text(size = 12)
+  
+  # 7 x 3 bivreg_covar_postdens
+  mcmc_dens(mcmc_chains_post, pars='Correlation') + facet_text(size = 12)
+  
+```
+
+```{r}
+  mean(c(length(which(gibbs_chain1$beta[1,1,]>0))/length(gibbs_chain1$beta[1,1,]),
+  length(which(gibbs_chain2$beta[1,1,]>0))/length(gibbs_chain2$beta[1,1,]),
+  length(which(gibbs_chain3$beta[1,1,]>0))/length(gibbs_chain3$beta[1,1,])))
+
+  mean(c(length(which(gibbs_chain1$beta[2,1,]>1))/length(gibbs_chain1$beta[2,1,]),
+  length(which(gibbs_chain2$beta[2,1,]>1))/length(gibbs_chain2$beta[2,1,]),
+  length(which(gibbs_chain3$beta[2,1,]>1))/length(gibbs_chain3$beta[2,1,])))
+
+  mean(c(length(which(gibbs_chain1$beta[3,1,]>0))/length(gibbs_chain1$beta[3,1,]),
+  length(which(gibbs_chain2$beta[3,1,]>0))/length(gibbs_chain2$beta[3,1,]),
+  length(which(gibbs_chain3$beta[3,1,]>0))/length(gibbs_chain3$beta[3,1,])))
+  
+  mean(c(length(which(gibbs_chain1$beta[1,2,]>0))/length(gibbs_chain1$beta[1,2,]),
+  length(which(gibbs_chain2$beta[1,2,]>0))/length(gibbs_chain2$beta[1,2,]),
+  length(which(gibbs_chain3$beta[1,2,]>0))/length(gibbs_chain3$beta[1,2,])))
+  
+  mean(c(length(which(gibbs_chain1$beta[2,2,]>0))/length(gibbs_chain1$beta[2,2,]),
+  length(which(gibbs_chain2$beta[2,2,]>0))/length(gibbs_chain2$beta[2,2,]),
+  length(which(gibbs_chain3$beta[2,2,]>0))/length(gibbs_chain3$beta[2,2,])))
+  
+  mean(c(length(which(gibbs_chain1$beta[3,2,]>1))/length(gibbs_chain1$beta[3,2,]),
+  length(which(gibbs_chain2$beta[3,2,]>1))/length(gibbs_chain2$beta[3,2,]),
+  length(which(gibbs_chain3$beta[3,2,]>1))/length(gibbs_chain3$beta[3,2,])))
+  
+  summary(mcmc_chains_post)
+```
+
+
+## Residual Analysis
+If a sample from the posterior distribution p($\vect{\beta}, \vect{\Omega} | \vect{y}_{obs})$ is denoted by $(\vect{\beta}_s, \vect{\Omega}_s)$, then a set of realised residuals is given by:
+\begin{align}
+\vect{\xi}_s &= \vect{y}_{obs} - E[\vect{y}_{obs}|\vect{X}_{obs},\vect{\beta}_s,\vect{\Omega} ] \nonumber \\
+\vect{\xi}_s &= \vect{y}_{obs} - \vect{X}_{obs} \vect{\beta}_s  (\#eq:realisedresiduals)
+\end{align} 
+where the $ (p-m) \times 3 $ matrix $\vect{X}_{obs}$ is the subset of $\vect{X}$ containing only the rows with forecasts that correspond to observed measurements. All forecasts in $\vect{X}_{obs}$ are observed. In order to obtain a sample of $\vect{\beta}$ from its posterior distribution, one of the iterations of the Gibbs Sampling chain following the warm-up period is randomly selected, and the value of $\vect{\beta}$ at this iteration is used. 
+
+The first graph plots a histogram of the northing residuals against a normal distribution with mean and standard deviation equal to those of the northing residuals. 
+
+```{r, fig.width=6, fig.height=4}
+  
+  sampled_residuals <- gibbs_chain1$residuals[,,warm_up:(n-1)]
+  mean_residuals <- rowMeans(sampled_residuals, dims = 2)
+  
+  northing_residuals <- mean_residuals[,1]
+  easting_residuals <- mean_residuals[,2]
+  
+  northing_res_std <- northing_residuals / sd(northing_residuals)
+  easting_res_std <- easting_residuals / sd(easting_residuals)
+  
+  standardised_residuals <- as_tibble(list(northing_residuals = northing_res_std, easting_residuals=easting_res_std))
+  
+  #histogram of residuals
+  #used dimensions 6 x 3, tick chairo dev box, histogram_residuals_northing
+  ggplot(standardised_residuals, aes(x = northing_residuals)) + 
+    geom_histogram(aes(y =..density..),
+                   bins = 30,
+                   colour = "black", 
+                   fill = "white") +
+  stat_function(fun = dnorm, args = list(mean = 0, sd = 1), col = 'red') + 
+  ylab("Frequency") + xlab("")
+  
+  #plot normal qqplot of errors
+  #used dimensions 6 x 3, tick chairo dev box, qqplot_residuals_northing
+  ggplot(standardised_residuals, aes(sample = northing_residuals)) +
+      stat_qq() + geom_abline(slope=1, intercept=0, col="red") + xlab("Theoretical Quantiles") + ylab("Sample Quantiles")
+  
+  #ggsave("qqplot.pdf", width=6, height=4)
+      
+  #ACF and PCF plots, acf_pacf_northing, 8 x 3
+  northing_resid_acf <- ggAcf(standardised_residuals$northing_residuals) + ggtitle("")
+  northing_resid_pacf <- ggPacf(standardised_residuals$northing_residuals) + ggtitle("")
+  grid.arrange(northing_resid_acf, northing_resid_pacf, ncol=2)
+  
+  #ACF and PCF plots, acf_pacf_easting, 8 x 3
+  easting_resid_acf <- ggAcf(standardised_residuals$easting_residuals) + ggtitle("")
+  easting_resid_pacf <- ggPacf(standardised_residuals$easting_residuals) + ggtitle("")
+  grid.arrange(easting_resid_acf, easting_resid_pacf, ncol=2)
+  
+  residuals_with_dates <- as_tibble(list(northing_residuals = standardised_residuals$northing_residuals, easting_residuals=standardised_residuals$easting_residuals, date = wind_comb$time))
+  
+
+  # 9 x 3, timeseries_residuals_northing
+  ggplot(residuals_with_dates) + 
+    geom_line(aes(x = date, y = northing_residuals)) + 
+    ylab("Standardised Northing Residuals") + xlab("Date")
+  
+  # 9 x 3, timeseries_residuals_easting
+  ggplot(residuals_with_dates) + 
+    geom_line(aes(x = date, y = easting_residuals)) + 
+    ylab("Standardised Easting Residuals") + xlab("Date")
+  
+```
+
+# Vector Autoregression on Residuals using R Package
+
+```{r}
+
+  set.seed(12345)
+
+  priors_minnesota <- bv_priors(hyper= c("alpha", "lambda", "psi"), 
+                      mn = bv_minnesota(lambda = bv_lambda(),
+                                        alpha = bv_alpha(),
+                                        psi = bv_psi(),
+                                        var = 10000000,
+                                        b = 1
+                                        ))
+
+  vec_autoreg1 <- bvar(mean_residuals, priors=priors_minnesota, lags = 4, n_draw = 10000, n_burn = 5000, n_thin = 1, include.mean=FALSE)
+  gibbs_autoreg_chain1 <- mcmc(vec_autoreg1)
+  
+  vec_autoreg2 <- bvar(mean_residuals, priors=priors_minnesota, lags = 4, n_draw = 10000, n_burn = 5000, n_thin = 1, include.mean=FALSE)
+  gibbs_autoreg_chain2 <- mcmc(vec_autoreg2)
+  
+  vec_autoreg3 <- bvar(mean_residuals, priors=priors_minnesota, lags = 4, n_draw = 10000, n_burn = 5000, n_thin = 1, include.mean=FALSE)
+  gibbs_autoreg_chain3 <- mcmc(vec_autoreg3)
+  
+  
+```
+
+```{r}
+  
+  autoreg_chain1 <- cbind(gibbs_autoreg_chain1$beta[,1,1], gibbs_autoreg_chain1$beta[,2,1],gibbs_autoreg_chain1$beta[,3,1],gibbs_autoreg_chain1$beta[,4,1], gibbs_autoreg_chain1$beta[,5,1],gibbs_autoreg_chain1$beta[,6,1],gibbs_autoreg_chain1$beta[,7,1],gibbs_autoreg_chain1$beta[,8,1], gibbs_autoreg_chain1$beta[,9,1], gibbs_autoreg_chain1$beta[,1,2],gibbs_autoreg_chain1$beta[,2,2],gibbs_autoreg_chain1$beta[,3,2], gibbs_autoreg_chain1$beta[,4,2],gibbs_autoreg_chain1$beta[,5,2],gibbs_autoreg_chain1$beta[,6,2],gibbs_autoreg_chain1$beta[,7,2], gibbs_autoreg_chain1$beta[,8,2],gibbs_autoreg_chain1$beta[,9,2], gibbs_autoreg_chain1$sigma[,1,1],gibbs_autoreg_chain1$sigma[,2,1], gibbs_autoreg_chain1$sigma[,2,2])
+  colnames(autoreg_chain1) <- c('phi[n[0]]', 'phi[n[1]]', 'phi*minute[n[1]]','phi[n[2]]', 'phi*minute[n[2]]','phi[n[3]]', 'phi*minute[n[3]]','phi[n[4]]', 'phi*minute[n[4]]','phi[e[0]]','phi[e[1]]', 'phi*minute[e[1]]', 'phi[e[2]]', 'phi*minute[e[2]]', 'phi[e[3]]', 'phi*minute[e[3]]','phi[e[4]]', 'phi*minute[e[4]]','Omega[epsilon["1,1"]]', 'Omega[epsilon["2,1"]]', 'Omega[epsilon["2,2"]]')
+  
+   autoreg_chain2 <- cbind(gibbs_autoreg_chain2$beta[,1,1], gibbs_autoreg_chain2$beta[,2,1],gibbs_autoreg_chain2$beta[,3,1],gibbs_autoreg_chain2$beta[,4,1], gibbs_autoreg_chain2$beta[,5,1],gibbs_autoreg_chain2$beta[,6,1],gibbs_autoreg_chain2$beta[,7,1],gibbs_autoreg_chain2$beta[,8,1], gibbs_autoreg_chain2$beta[,9,1], gibbs_autoreg_chain2$beta[,1,2],gibbs_autoreg_chain2$beta[,2,2],gibbs_autoreg_chain2$beta[,3,2], gibbs_autoreg_chain2$beta[,4,2],gibbs_autoreg_chain2$beta[,5,2],gibbs_autoreg_chain2$beta[,6,2],gibbs_autoreg_chain2$beta[,7,2], gibbs_autoreg_chain2$beta[,8,2],gibbs_autoreg_chain2$beta[,9,2], gibbs_autoreg_chain2$sigma[,1,1],gibbs_autoreg_chain2$sigma[,2,1], gibbs_autoreg_chain2$sigma[,2,2])
+  colnames(autoreg_chain2) <- c('phi[n[0]]', 'phi[n[1]]', 'phi*minute[n[1]]','phi[n[2]]', 'phi*minute[n[2]]','phi[n[3]]', 'phi*minute[n[3]]','phi[n[4]]', 'phi*minute[n[4]]','phi[e[0]]','phi[e[1]]', 'phi*minute[e[1]]', 'phi[e[2]]', 'phi*minute[e[2]]', 'phi[e[3]]', 'phi*minute[e[3]]','phi[e[4]]', 'phi*minute[e[4]]','Omega[epsilon["1,1"]]', 'Omega[epsilon["2,1"]]', 'Omega[epsilon["2,2"]]')
+  
+  autoreg_chain3 <- cbind(gibbs_autoreg_chain3$beta[,1,1], gibbs_autoreg_chain3$beta[,2,1],gibbs_autoreg_chain3$beta[,3,1],gibbs_autoreg_chain3$beta[,4,1], gibbs_autoreg_chain3$beta[,5,1],gibbs_autoreg_chain3$beta[,6,1],gibbs_autoreg_chain3$beta[,7,1],gibbs_autoreg_chain3$beta[,8,1], gibbs_autoreg_chain3$beta[,9,1], gibbs_autoreg_chain3$beta[,1,2],gibbs_autoreg_chain3$beta[,2,2],gibbs_autoreg_chain3$beta[,3,2], gibbs_autoreg_chain3$beta[,4,2],gibbs_autoreg_chain3$beta[,5,2],gibbs_autoreg_chain3$beta[,6,2],gibbs_autoreg_chain3$beta[,7,2], gibbs_autoreg_chain3$beta[,8,2],gibbs_autoreg_chain3$beta[,9,2], gibbs_autoreg_chain3$sigma[,1,1],gibbs_autoreg_chain3$sigma[,2,1], gibbs_autoreg_chain3$sigma[,2,2])
+  colnames(autoreg_chain3) <- c('phi[n[0]]', 'phi[n[1]]', 'phi*minute[n[1]]','phi[n[2]]', 'phi*minute[n[2]]','phi[n[3]]', 'phi*minute[n[3]]','phi[n[4]]', 'phi*minute[n[4]]','phi[e[0]]','phi[e[1]]', 'phi*minute[e[1]]', 'phi[e[2]]', 'phi*minute[e[2]]', 'phi[e[3]]', 'phi*minute[e[3]]','phi[e[4]]', 'phi*minute[e[4]]','Omega[epsilon["1,1"]]', 'Omega[epsilon["2,1"]]', 'Omega[epsilon["2,2"]]')
+  
+  
+  mcmc_autoreg_chain1 <- mcmc(autoreg_chain1)
+  mcmc_autoreg_chain2 <- mcmc(autoreg_chain2)
+  mcmc_autoreg_chain3 <- mcmc(autoreg_chain3)
+  
+  mcmc_autoreg_chains <- mcmc.list(mcmc_autoreg_chain1, mcmc_autoreg_chain2, mcmc_autoreg_chain3)
+  
+
+```
+
+```{r}
+  
+  color_scheme_set(c("blue", "yellow", "red", "orange", "green", "pink"))
+  # 7 x 9 autoreg_trace_plots
+  mcmc_trace(mcmc_autoreg_chains, facet_args = list(labeller = ggplot2::label_parsed, ncol=3)) + facet_text(size = 13)
+
+  color_scheme_set('mix-darkgray-blue')
+  # 8 x 11 (10?) autoreg_dens_plots
+  mcmc_dens(mcmc_autoreg_chains, facet_args = list(labeller = ggplot2::label_parsed, ncol=3)) + facet_text(size = 13)
+```
+
+Results analysis
+```{r}
+  mean(c(length(which(gibbs_autoreg_chain1$beta[,1,1]>0))/length(gibbs_autoreg_chain1$beta[,1,1]),
+  length(which(gibbs_autoreg_chain2$beta[,1,1]>0))/length(gibbs_autoreg_chain2$beta[,1,1]),
+  length(which(gibbs_autoreg_chain3$beta[,1,1]>0))/length(gibbs_autoreg_chain3$beta[,1,1])))
+
+  mean(c(length(which(gibbs_autoreg_chain1$beta[,1,2]>0))/length(gibbs_autoreg_chain1$beta[,1,2]),
+  length(which(gibbs_autoreg_chain2$beta[,1,2]>0))/length(gibbs_autoreg_chain2$beta[,1,2]),
+  length(which(gibbs_autoreg_chain3$beta[,1,2]>0))/length(gibbs_autoreg_chain3$beta[,1,2])))
+  
+  mean(c(length(which(gibbs_autoreg_chain1$beta[,7,1]>0))/length(gibbs_autoreg_chain1$beta[,7,1]),
+  length(which(gibbs_autoreg_chain2$beta[,7,1]>0))/length(gibbs_autoreg_chain2$beta[,7,1]),
+  length(which(gibbs_autoreg_chain3$beta[,7,1]>0))/length(gibbs_autoreg_chain3$beta[,7,1])))
+  
+  mean(c(length(which(gibbs_autoreg_chain1$beta[,4,2]>0))/length(gibbs_autoreg_chain1$beta[,4,2]),
+  length(which(gibbs_autoreg_chain2$beta[,4,2]>0))/length(gibbs_autoreg_chain2$beta[,4,2]),
+  length(which(gibbs_autoreg_chain3$beta[,4,2]>0))/length(gibbs_autoreg_chain3$beta[,4,2])))
+  
+  mean(c(length(which(gibbs_autoreg_chain1$beta[,6,2]>0))/length(gibbs_autoreg_chain1$beta[,6,2]),
+  length(which(gibbs_autoreg_chain2$beta[,6,2]>0))/length(gibbs_autoreg_chain2$beta[,6,2]),
+  length(which(gibbs_autoreg_chain3$beta[,6,2]>0))/length(gibbs_autoreg_chain3$beta[,6,2])))
+  
+  summary(mcmc_autoreg_chains)
+```
+
+## Residuals following bayesian vector autoregression
+```{r}
+  mean_autoregr_residuals <- (residuals(vec_autoreg1, type="mean")[,] + residuals(vec_autoreg2, type="mean")[,]+residuals(vec_autoreg2, type="mean")[,])/3
+  
+
+  northing_autoregression_residuals <- mean_autoregr_residuals[,1]
+  easting_autoregression_residuals <- mean_autoregr_residuals[,2]
+  
+  northing_autoregr_res_std <- northing_autoregression_residuals / sd(northing_autoregression_residuals)
+  easting_autoregr_res_std <- easting_autoregression_residuals / sd(easting_autoregression_residuals)
+  
+  standardised_autoregr_residuals <- as_tibble(list(northing_residuals = northing_autoregr_res_std, easting_residuals=easting_autoregr_res_std))
+  
+  #histogram of residuals
+  #used dimensions 6 x 3, tick chairo dev box, histogram_autoreg_residuals_northing
+  ggplot(standardised_autoregr_residuals, aes(x = northing_residuals)) + 
+    geom_histogram(aes(y =..density..),
+                   bins = 30,
+                   colour = "black", 
+                   fill = "white") +
+  stat_function(fun = dnorm, args = list(mean = 0, sd = 1), col = 'red') + 
+  ylab("Frequency") + xlab("")
+  
+  #qqplot
+  #used dimensions 6 x 3, tick chairo dev box, qqplot_autoreg_residuals_northing
+  ggplot(standardised_autoregr_residuals, aes(sample = northing_residuals)) +
+      stat_qq() + geom_abline(slope=1, intercept=0, col="red") + xlab("Theoretical Quantiles") + ylab("Sample Quantiles")
+  
+  #ACF and PCF plots, acf_pacf_autoreg_northing, 8 x 3
+  northing_resid_acf <- ggAcf(standardised_autoregr_residuals$northing_residuals) + ggtitle("") + ylim(-.05,0.2)
+  northing_resid_pacf <- ggPacf(standardised_autoregr_residuals$northing_residuals) + ggtitle("")+ ylim(-.05,0.2)
+  grid.arrange(northing_resid_acf, northing_resid_pacf, ncol=2)
+  
+  #ACF and PCF plots, acf_pacf_autoreg_easting, 8 x 3
+  easting_resid_acf <- ggAcf(standardised_autoregr_residuals$easting_residuals) + ggtitle("")+ ylim(-.05,0.2)
+  easting_resid_pacf <- ggPacf(standardised_autoregr_residuals$easting_residuals) + ggtitle("")+ ylim(-.05,0.2)
+  grid.arrange(easting_resid_acf, easting_resid_pacf, ncol=2)
+  
+  #ACF and PCF plots, acf_pacf_autoreg_northing_squared, 8 x 3
+  northing_resid_sq_acf <- ggAcf(standardised_autoregr_residuals$northing_residuals^2) + ggtitle("") + ylim(-.05,0.2)
+  northing_resid_sq_pacf <- ggPacf(standardised_autoregr_residuals$northing_residuals^2) + ggtitle("")+ ylim(-.05,0.2)
+  grid.arrange(northing_resid_sq_acf, northing_resid_sq_pacf, ncol=2)
+  
+  #ACF and PCF plots, acf_pacf_autoreg_easting_squared, 8 x 3
+  easting_resid_sq_acf <- ggAcf(standardised_autoregr_residuals$easting_residuals^2) + ggtitle("") + ylim(-.05,0.2)
+  easting_resid_sq_pacf <- ggPacf(standardised_autoregr_residuals$easting_residuals^2) + ggtitle("")+ ylim(-.05,0.2)
+  grid.arrange(easting_resid_sq_acf, easting_resid_sq_pacf, ncol=2)
+  
+  
+  #residual time series plot
+  autoregr_order <- 4
+  n_res <- length(northing_residuals)
+  autoregression_std_residuals_with_dates <- as_tibble(list(northing_residuals = standardised_autoregr_residuals$northing_residuals, easting_residuals=standardised_autoregr_residuals$easting_residuals, date = wind_comb$time[(autoregr_order+1):n_res]))
+
+  
+  #residual time series plot
+   # 9 x 3, timeseries_autoreg_residuals_northing
+  ggplot(autoregression_std_residuals_with_dates) + 
+    geom_line(aes(x = date, y = northing_residuals)) + 
+    ylab("Northing Standardised Residuals") + xlab("Date")
+  
+  ggplot(autoregression_std_residuals_with_dates) + 
+    geom_line(aes(x = date, y = easting_residuals)) + 
+    ylab("Easting Standardised Residuals") + xlab("Date")
+
+```
+
+# GARCH Analysis
+
+```{r, include=FALSE, results='hide',message=FALSE, warning=FALSE,error=FALSE}
+library(rstan)
+library(stats)
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+knitr::opts_chunk$set(echo = TRUE, tidy=TRUE)
+```
+
+```{stan, biGarchBEKKstudentt, output.var="biGarchBEKK_studentt", cache=TRUE}
+data {
+  int<lower=0> T;
+  matrix[2,T] r;
+  cov_matrix[2] H1;
+}
+
+transformed data {
+  matrix[2,2] vechr[T];
+  for (t in 1:T){
+    vechr[t] = r[,t] * r[,t]';
+  }
+}
+
+parameters {
+  real<lower=0> a11;
+  real<lower=0> a22;
+  real<lower=0, upper=sqrt(1-a11^2)> b11;
+  real<lower=0, upper=sqrt(1-a22^2)> b22;
+  real<lower=0> c11;
+  real c21;
+  real<lower=0> c22;
+  real<lower=0> nu;
+}
+
+transformed parameters {
+  cov_matrix[2] H[T];
+  matrix[2,2] C = [[c11,c21],[c21,c22]]; 
+  real northing_std_residuals[T];
+  real easting_std_residuals[T];
+  vector[2] A = [a11,a22]';
+  vector[2] B = [b11,b22]';
+  H[1] = H1;
+  for (t in 2:T){
+    H[t] = C + quad_form_diag(vechr[t-1],A) + quad_form_diag(H[t-1],B); 
+  }
+  
+  for (t in 1:T){
+    northing_std_residuals[t] = r[1,t] / sqrt(H[t,1,1]);
+    easting_std_residuals[t] = r[2,t] / sqrt(H[t,2,2]);
+  }
+  
+}
+
+model {
+  for (t in 1:T){
+    r[,t] ~ multi_student_t(nu, [0,0], H[t]);
+  }
+}
+
+```
+
+```{r, results='hide', message=FALSE}
+
+r <- t(cbind(northing_autoregression_residuals, easting_autoregression_residuals))
+data.in <- list(T = length(northing_autoregression_residuals), r = r, H1 = diag(2))
+
+fitbekkt <- sampling(biGarchBEKK_studentt, data=data.in, control = list(adapt_delta=0.95, max_treedepth=15), chain = 3, iter=2000, seed=1)
+
+```
+
+```{r, results='hide', message=FALSE}
+#options(scipen=999)
+#print(fitbekkt, digits=3)
+
+#fitbekkt3
+
+names(fitbekkt)[1:7] <-c('A["1,1"]','A["2,2"]','B["1,1"]','B["2,2"]','C["1,1"]','C["2,1"]', 'C["2,2"]')
+posterior_chains_fitbekkt <- as.array(fitbekkt, pars=c('A["1,1"]','A["2,2"]','B["1,1"]','B["2,2"]', 'C["1,1"]','C["2,1"]', 'C["2,2"]', 'nu'))
+
+#garch_trace, 8 x 6
+color_scheme_set(c("blue", "yellow", "red", "orange", "green", "pink"))
+mcmc_trace(posterior_chains_fitbekkt, pars=c('A["1,1"]','A["2,2"]','B["1,1"]','B["2,2"]', 'C["1,1"]','C["2,1"]', 'C["2,2"]', 'nu'), facet_args = list(labeller = ggplot2::label_parsed)) + facet_text(size = 13)
+summary(fitbekkt)
+```
+
+```{r, results='hide', message=FALSE}
+#garch_dens, 8 x 6
+color_scheme_set('mix-darkgray-blue')
+mcmc_dens(posterior_chains_fitbekkt, pars=c('A["1,1"]','A["2,2"]','B["1,1"]','B["2,2"]', 'C["1,1"]','C["2,1"]', 'C["2,2"]', 'nu'), facet_args = list(labeller = ggplot2::label_parsed)) + facet_text(size = 13)
+
+garch_bekkt_north <- array(get_posterior_mean(fitbekkt, pars='northing_std_residuals'))[2:length(northing_autoregression_residuals)]
+
+garch_bekkt_east <- array(get_posterior_mean(fitbekkt, pars='easting_std_residuals'))[2:length(northing_autoregression_residuals)]
+
+plot(garch_bekkt_north, type='l')
+invisible(acf2(garch_bekkt_north))
+invisible(acf2(garch_bekkt_north^2))
+
+garch_bekkt_resid <- as_tibble(list(northing_residuals = garch_bekkt_north, easting_residuals=garch_bekkt_east, date = wind_comb$time[(autoregr_order+2):n_res]))
+
+#qqplot
+#used dimensions 6 x 3, tick chairo dev box, qqplot_garch_residuals_northing
+ggplot(garch_bekkt_resid, aes(sample = northing_residuals)) + stat_qq(distribution=stats::qt, dparams=list(get_posterior_mean(fitbekkt, pars='nu'))) + geom_abline(slope=1, intercept=0, col="red")+ xlab("Theoretical Quantiles") + ylab("Sample Quantiles")
+
+#used dimensions 8 x 3, tick chairo dev box, acf_pacf_garch_northing
+northing_resid_acf <- ggAcf(garch_bekkt_resid$northing_residuals) + ggtitle("") + ylim(-.05,0.15)
+northing_resid_pacf <- ggPacf(garch_bekkt_resid$northing_residuals) + ggtitle("") + ylim(-.05,0.15)
+grid.arrange(northing_resid_acf, northing_resid_pacf, ncol=2)
+
+#used dimensions 8 x 3, tick chairo dev box, acf_pacf_garch_northing_squared
+northing_resid_acf <- ggAcf(garch_bekkt_resid$northing_residuals^2) + ggtitle("") + ylim(-.05,0.2)
+northing_resid_pacf <- ggPacf(garch_bekkt_resid$northing_residuals^2) + ggtitle("")+ ylim(-.05,0.2)
+grid.arrange(northing_resid_acf, northing_resid_pacf, ncol=2)
+
+
+#used dimensions 9 x 3, tick chairo dev box, timeseries_garch_northing
+ggplot(garch_bekkt_resid) + 
+    geom_line(aes(x = date, y = northing_residuals)) + 
+    ylab("Northing Standardised Residuals") + xlab("Date")
+```
+
